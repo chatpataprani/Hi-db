@@ -1,6 +1,8 @@
 import os
 import re
 import time
+import hashlib
+from functools import lru_cache
 from typing import Any
 
 import pyarrow as pa
@@ -28,10 +30,35 @@ AADHAAR_FILES = sorted(fs.glob(f"{BUCKET}/indexes/idx_aadhaar.*.parquet"))
 if not AADHAAR_FILES:
     AADHAAR_FILES = sorted(fs.glob(f"{BUCKET}/indexes/idx_aadhar.*.parquet"))
 
-INDEX_READY = bool(PHONE_FILES and AADHAAR_FILES)
+SHARDS = 256
+PHONE_SHARDS = {i: [] for i in range(SHARDS)}
+AADHAAR_SHARDS = {i: [] for i in range(SHARDS)}
 
-phone_dataset = ds.dataset(PHONE_FILES, filesystem=fs, format="parquet") if PHONE_FILES else None
-aadhaar_dataset = ds.dataset(AADHAAR_FILES, filesystem=fs, format="parquet") if AADHAAR_FILES else None
+def _shard(value: str) -> int:
+    return int.from_bytes(hashlib.blake2b(value.encode(), digest_size=4).digest(), "big") % SHARDS
+
+for path in PHONE_FILES:
+    name = path.rsplit("/", 1)[-1]
+    try:
+        PHONE_SHARDS[int(name.split(".")[1])].append(path)
+    except (IndexError, ValueError):
+        pass
+
+for path in AADHAAR_FILES:
+    name = path.rsplit("/", 1)[-1]
+    try:
+        AADHAAR_SHARDS[int(name.split(".")[1])].append(path)
+    except (IndexError, ValueError):
+        pass
+
+INDEX_READY = any(PHONE_SHARDS.values()) and any(AADHAAR_SHARDS.values())
+
+@lru_cache(maxsize=512)
+def _dataset(kind: str, shard: int):
+    files = PHONE_SHARDS[shard] if kind == "phone" else AADHAAR_SHARDS[shard]
+    if not files:
+        return None
+    return ds.dataset(files, filesystem=fs, format="parquet")
 
 def _column_type(dataset: ds.Dataset, column: str) -> pa.DataType:
     try:
@@ -53,9 +80,10 @@ def _typed_value(dataset: ds.Dataset, column: str, value: str) -> Any:
             raise HTTPException(400, f"{column} is numeric but the supplied value is invalid.") from exc
     return value
 
-def _lookup(dataset: ds.Dataset | None, column: str, value: str) -> dict[str, Any]:
+def _lookup(kind: str, column: str, value: str) -> dict[str, Any]:
+    dataset = _dataset(kind, _shard(value))
     if dataset is None:
-        raise HTTPException(503, "Index is not built yet. Run build_index.py once.")
+        raise HTTPException(503, "Index is not built yet. Run build_hitech_index.py once.")
     started = time.perf_counter()
     typed = _typed_value(dataset, column, value)
     scanner = dataset.scanner(filter=ds.field(column) == typed, batch_size=BATCH_SIZE, use_threads=True)
@@ -100,7 +128,7 @@ def number_lookup(number: str):
     number = number.strip()
     if not PHONE_RE.fullmatch(number):
         raise HTTPException(400, "Number must contain 10 to 15 digits.")
-    data = _lookup(phone_dataset, "phoneNumber", number)
+    data = _lookup("phone", "phoneNumber", number)
     return {"status": "success" if data["count"] else "not_found", "developer": DEVELOPER, "type": "number", "number": number, **data}
 
 @app.get("/aadhar={aadhar}")
@@ -108,5 +136,5 @@ def aadhar_lookup(aadhar: str):
     aadhar = aadhar.strip()
     if not AADHAAR_RE.fullmatch(aadhar):
         raise HTTPException(400, "Aadhaar value must contain exactly 12 digits.")
-    data = _lookup(aadhaar_dataset, "aadharNumber", aadhar)
+    data = _lookup("aadhar", "aadharNumber", aadhar)
     return {"status": "success" if data["count"] else "not_found", "developer": DEVELOPER, "type": "aadhar", "aadhar": aadhar, **data}
