@@ -8,7 +8,7 @@ from fastapi import FastAPI, HTTPException, Query
 
 app = FastAPI(title="Hi-db Fast Lookup API", version="1.1.0")
 
-DATABASE_URL = "https://huggingface.co/buckets/Chatpataprani/HITECH_DATABASE-bucket"\n# Hardcoded database source requested by the owner.\nINDEX_BASE_URL = os.getenv("INDEX_BASE_URL", "").rstrip("/") or DATABASE_URL
+DATABASE_URL = "https://huggingface.co/buckets/Chatpataprani/HITECH_DATABASE-bucket"\n# Hardcoded database source requested by the owner.\nINDEX_BASE_URL = os.getenv("INDEX_BASE_URL", "").rstrip("/")
 INDEX_TOKEN = os.getenv("INDEX_TOKEN", "")
 SHARD_COUNT = int(os.getenv("SHARD_COUNT", "256"))
 MAX_RESULTS = int(os.getenv("MAX_RESULTS", "25"))
