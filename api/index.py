@@ -8,9 +8,7 @@ import pyarrow.dataset as ds
 from fastapi import FastAPI, HTTPException
 from huggingface_hub import HfFileSystem
 
-# Hardcoded 227 GB indexed database used by the uploaded working API.
-BUCKET = "buckets/CutehackX/icrm-hitek-full-db-mixed-bucket"
-
+BUCKET = "buckets/Chatpataprani/HITECH_DATABASE-bucket"
 HF_TOKEN = os.getenv("HF_TOKEN") or None
 MAX_RESULTS = int(os.getenv("MAX_RESULTS", "25"))
 BATCH_SIZE = int(os.getenv("BATCH_SIZE", "4096"))
@@ -19,38 +17,27 @@ DEVELOPER = "chatpataprani"
 PHONE_RE = re.compile(r"^\d{10,15}$")
 AADHAAR_RE = re.compile(r"^\d{12}$")
 
-app = FastAPI(
-    title="Hi-db Fast Lookup API",
-    version="4.0",
-    description="Fast Parquet index lookup API — Developer: chatpataprani",
-)
+app = FastAPI(title="Hi-db HITECH Fast Lookup API", version="5.0")
 
 fs = HfFileSystem(token=HF_TOKEN)
 
-PHONE_FILES = sorted(fs.glob(f"{BUCKET}/idx_phone.*.parquet"))
-AADHAAR_FILES = sorted(fs.glob(f"{BUCKET}/idx_aadhaar.*.parquet"))
-
+# Only compact indexes are queried at request time. The raw ~75 GB database
+# is never scanned per request.
+PHONE_FILES = sorted(fs.glob(f"{BUCKET}/indexes/idx_phone.*.parquet"))
+AADHAAR_FILES = sorted(fs.glob(f"{BUCKET}/indexes/idx_aadhaar.*.parquet"))
 if not AADHAAR_FILES:
-    AADHAAR_FILES = sorted(fs.glob(f"{BUCKET}/idx_aadhar.*.parquet"))
+    AADHAAR_FILES = sorted(fs.glob(f"{BUCKET}/indexes/idx_aadhar.*.parquet"))
 
-if not PHONE_FILES:
-    raise RuntimeError("No idx_phone.*.parquet files were found in the Hugging Face bucket.")
+INDEX_READY = bool(PHONE_FILES and AADHAAR_FILES)
 
-if not AADHAAR_FILES:
-    raise RuntimeError("No idx_aadhaar.*.parquet or idx_aadhar.*.parquet files were found.")
-
-phone_dataset = ds.dataset(PHONE_FILES, filesystem=fs, format="parquet")
-aadhaar_dataset = ds.dataset(AADHAAR_FILES, filesystem=fs, format="parquet")
-
+phone_dataset = ds.dataset(PHONE_FILES, filesystem=fs, format="parquet") if PHONE_FILES else None
+aadhaar_dataset = ds.dataset(AADHAAR_FILES, filesystem=fs, format="parquet") if AADHAAR_FILES else None
 
 def _column_type(dataset: ds.Dataset, column: str) -> pa.DataType:
     try:
         return dataset.schema.field(column).type
     except KeyError as exc:
-        raise RuntimeError(
-            f"Required index column '{column}' was not found. Available columns: {dataset.schema.names}"
-        ) from exc
-
+        raise RuntimeError(f"Required index column '{column}' was not found. Available columns: {dataset.schema.names}") from exc
 
 def _typed_value(dataset: ds.Dataset, column: str, value: str) -> Any:
     dtype = _column_type(dataset, column)
@@ -66,19 +53,13 @@ def _typed_value(dataset: ds.Dataset, column: str, value: str) -> Any:
             raise HTTPException(400, f"{column} is numeric but the supplied value is invalid.") from exc
     return value
 
-
-def _lookup(dataset: ds.Dataset, column: str, value: str) -> dict[str, Any]:
+def _lookup(dataset: ds.Dataset | None, column: str, value: str) -> dict[str, Any]:
+    if dataset is None:
+        raise HTTPException(503, "Index is not built yet. Run build_index.py once.")
     started = time.perf_counter()
     typed = _typed_value(dataset, column, value)
-    filter_expr = ds.field(column) == typed
+    scanner = dataset.scanner(filter=ds.field(column) == typed, batch_size=BATCH_SIZE, use_threads=True)
     rows: list[dict[str, Any]] = []
-
-    scanner = dataset.scanner(
-        filter=filter_expr,
-        batch_size=BATCH_SIZE,
-        use_threads=True,
-    )
-
     for batch in scanner.to_batches():
         remaining = MAX_RESULTS - len(rows)
         if remaining <= 0:
@@ -86,41 +67,33 @@ def _lookup(dataset: ds.Dataset, column: str, value: str) -> dict[str, Any]:
         rows.extend(batch.to_pylist()[:remaining])
         if len(rows) >= MAX_RESULTS:
             break
-
-    return {
-        "results": rows,
-        "count": len(rows),
-        "lookup_ms": round((time.perf_counter() - started) * 1000, 2),
-    }
-
+    return {"results": rows, "count": len(rows), "lookup_ms": round((time.perf_counter() - started) * 1000, 3)}
 
 @app.get("/")
 def root():
     return {
         "status": "online",
         "developer": DEVELOPER,
+        "database": "Chatpataprani/HITECH_DATABASE-bucket",
+        "database_size": "~75 GB",
         "backend": "PyArrow + HuggingFace HfFileSystem",
-        "database": BUCKET,
-        "endpoints": {
-            "number": "/number=<10-15 digit number>",
-            "aadhar": "/aadhar=<12 digit Aadhaar>",
-        },
+        "index_ready": INDEX_READY,
         "phone_index_parts": len(PHONE_FILES),
         "aadhar_index_parts": len(AADHAAR_FILES),
+        "endpoints": {"number": "/number=<10-15 digit number>", "aadhar": "/aadhar=<12 digit Aadhaar>", "health": "/health"},
     }
-
 
 @app.get("/health")
 def health():
     return {
         "status": "ok",
         "developer": DEVELOPER,
-        "backend": "PyArrow + HuggingFace HfFileSystem",
-        "database": BUCKET,
+        "database": "Chatpataprani/HITECH_DATABASE-bucket",
+        "database_size": "~75 GB",
+        "index_ready": INDEX_READY,
         "phone_index_parts": len(PHONE_FILES),
         "aadhar_index_parts": len(AADHAAR_FILES),
     }
-
 
 @app.get("/number={number}")
 def number_lookup(number: str):
@@ -128,14 +101,7 @@ def number_lookup(number: str):
     if not PHONE_RE.fullmatch(number):
         raise HTTPException(400, "Number must contain 10 to 15 digits.")
     data = _lookup(phone_dataset, "phoneNumber", number)
-    return {
-        "status": "success" if data["count"] else "not_found",
-        "developer": DEVELOPER,
-        "type": "number",
-        "number": number,
-        **data,
-    }
-
+    return {"status": "success" if data["count"] else "not_found", "developer": DEVELOPER, "type": "number", "number": number, **data}
 
 @app.get("/aadhar={aadhar}")
 def aadhar_lookup(aadhar: str):
@@ -143,10 +109,4 @@ def aadhar_lookup(aadhar: str):
     if not AADHAAR_RE.fullmatch(aadhar):
         raise HTTPException(400, "Aadhaar value must contain exactly 12 digits.")
     data = _lookup(aadhaar_dataset, "aadharNumber", aadhar)
-    return {
-        "status": "success" if data["count"] else "not_found",
-        "developer": DEVELOPER,
-        "type": "aadhar",
-        "aadhar": aadhar,
-        **data,
-    }
+    return {"status": "success" if data["count"] else "not_found", "developer": DEVELOPER, "type": "aadhar", "aadhar": aadhar, **data}
