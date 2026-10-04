@@ -8,7 +8,7 @@ from fastapi import FastAPI, HTTPException, Query
 
 app = FastAPI(title="Hi-db Fast Lookup API", version="1.1.0")
 
-INDEX_BASE_URL = os.getenv("INDEX_BASE_URL", "").rstrip("/")
+DATABASE_URL = "https://huggingface.co/buckets/Chatpataprani/HITECH_DATABASE-bucket"\n# Hardcoded database source requested by the owner.\nINDEX_BASE_URL = os.getenv("INDEX_BASE_URL", "").rstrip("/") or DATABASE_URL
 INDEX_TOKEN = os.getenv("INDEX_TOKEN", "")
 SHARD_COUNT = int(os.getenv("SHARD_COUNT", "256"))
 MAX_RESULTS = int(os.getenv("MAX_RESULTS", "25"))
@@ -25,7 +25,7 @@ def shard(key: str) -> int:
 @lru_cache(maxsize=4096)
 def lookup(key: str):
     if not INDEX_BASE_URL:
-        raise RuntimeError("INDEX_BASE_URL is not configured")
+        raise RuntimeError("Database source is not configured")
     url = f"{INDEX_BASE_URL}/records-{shard(key):03d}.json"
     headers = {"Authorization": f"Bearer {INDEX_TOKEN}"} if INDEX_TOKEN else {}
     response = client.get(url, headers=headers)
@@ -64,7 +64,7 @@ def root():
 def health():
     return {
         "status": "ok",
-        "index_configured": bool(INDEX_BASE_URL),
+        "index_configured": bool(INDEX_BASE_URL),\n        "database_url": DATABASE_URL,
         "shards": SHARD_COUNT,
         "cache": lookup.cache_info()._asdict(),
     }
