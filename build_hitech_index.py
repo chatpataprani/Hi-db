@@ -20,6 +20,7 @@ import json
 import os
 import shutil
 import zipfile
+from collections import defaultdict
 from pathlib import Path
 
 import pyarrow as pa
@@ -65,28 +66,26 @@ def first_key(row: dict, keys: tuple[str, ...]) -> str | None:
     return None
 
 
-def write_batches(rows: list[dict], out_dir: Path, key: str, counters: list[int]) -> None:
+def write_batches(rows: list[dict], key: str, counters: list[int]) -> None:
     if not rows:
         return
-    table = pa.Table.from_pylist(rows)
-    for shard in range(SHARDS):
-        # Partition in Python so each request only opens one small shard.
-        selected = [r for r in rows if int.from_bytes(
-            hashlib.blake2b(str(r[key]).encode(), digest_size=4).digest(), "big"
-        ) % SHARDS == shard]
-        if not selected:
-            continue
-        shard_dir = out_dir / key
-        shard_dir.mkdir(parents=True, exist_ok=True)
+    grouped = defaultdict(list)
+    for row in rows:
+        value = str(row[key]).encode()
+        shard = int.from_bytes(hashlib.blake2b(value, digest_size=4).digest(), "big") % SHARDS
+        grouped[shard].append(row)
+    shard_dir = OUT / ("idx_phone" if key == "phoneNumber" else "idx_aadhaar")
+    shard_dir.mkdir(parents=True, exist_ok=True)
+    prefix = "idx_phone" if key == "phoneNumber" else "idx_aadhaar"
+    for shard, selected in grouped.items():
         part = counters[shard]
         pq.write_table(
             pa.Table.from_pylist(selected),
-            shard_dir / f"{shard:03d}-{part:05d}.parquet",
+            shard_dir / f"{prefix}.{shard:03d}.{part:05d}.parquet",
             compression="zstd",
             use_dictionary=True,
         )
         counters[shard] += 1
-
 
 def process_csv(zf: zipfile.ZipFile, name: str) -> None:
     with zf.open(name, "r") as raw:
@@ -106,10 +105,10 @@ def process_csv(zf: zipfile.ZipFile, name: str) -> None:
                 row["aadharNumber"] = aadhaar
                 aadhaar_rows.append(row)
             if len(phone_rows) >= BATCH_ROWS:
-                write_batches(phone_rows, OUT, "phoneNumber", pc)
+                write_batches(phone_rows, "phoneNumber", pc)
                 phone_rows.clear()
             if len(aadhaar_rows) >= BATCH_ROWS:
-                write_batches(aadhaar_rows, OUT, "aadharNumber", ac)
+                write_batches(aadhaar_rows, "aadharNumber", ac)
                 aadhaar_rows.clear()
         write_batches(phone_rows, OUT, "phoneNumber", pc)
         write_batches(aadhaar_rows, OUT, "aadharNumber", ac)
@@ -162,8 +161,8 @@ def main() -> None:
             else:
                 process_jsonl(zf, name)
     print("Indexes created under", OUT)
-    print("Upload OUT/phoneNumber/*.parquet to", BUCKET + "/indexes/idx_phone/")
-    print("Upload OUT/aadharNumber/*.parquet to", BUCKET + "/indexes/idx_aadhaar/")
+    print("Upload OUT/idx_phone/*.parquet to", BUCKET + "/indexes/idx_phone/")
+    print("Upload OUT/idx_aadhaar/*.parquet to", BUCKET + "/indexes/idx_aadhaar/")
 
 
 if __name__ == "__main__":
