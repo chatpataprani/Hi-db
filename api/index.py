@@ -1,86 +1,152 @@
-import hashlib
 import os
+import re
 import time
-from functools import lru_cache
+from typing import Any
 
-import httpx
-from fastapi import FastAPI, HTTPException, Query
+import pyarrow as pa
+import pyarrow.dataset as ds
+from fastapi import FastAPI, HTTPException
+from huggingface_hub import HfFileSystem
 
-app = FastAPI(title="Hi-db Fast Lookup API", version="1.1.0")
+# Hardcoded 227 GB indexed database used by the uploaded working API.
+BUCKET = "buckets/CutehackX/icrm-hitek-full-db-mixed-bucket"
 
-DATABASE_URL = "https://huggingface.co/buckets/Chatpataprani/HITECH_DATABASE-bucket"\n# Hardcoded database source requested by the owner.\nINDEX_BASE_URL = os.getenv("INDEX_BASE_URL", "").rstrip("/")
-INDEX_TOKEN = os.getenv("INDEX_TOKEN", "")
-SHARD_COUNT = int(os.getenv("SHARD_COUNT", "256"))
+HF_TOKEN = os.getenv("HF_TOKEN") or None
 MAX_RESULTS = int(os.getenv("MAX_RESULTS", "25"))
+BATCH_SIZE = int(os.getenv("BATCH_SIZE", "4096"))
+DEVELOPER = "chatpataprani"
 
-client = httpx.Client(
-    timeout=httpx.Timeout(2.0, connect=1.0),
-    limits=httpx.Limits(max_connections=32, max_keepalive_connections=16),
+PHONE_RE = re.compile(r"^\d{10,15}$")
+AADHAAR_RE = re.compile(r"^\d{12}$")
+
+app = FastAPI(
+    title="Hi-db Fast Lookup API",
+    version="4.0",
+    description="Fast Parquet index lookup API — Developer: chatpataprani",
 )
 
-def shard(key: str) -> int:
-    digest = hashlib.blake2b(key.encode(), digest_size=4).digest()
-    return int.from_bytes(digest, "big") % SHARD_COUNT
+fs = HfFileSystem(token=HF_TOKEN)
 
-@lru_cache(maxsize=4096)
-def lookup(key: str):
-    if not INDEX_BASE_URL:
-        raise RuntimeError("Database source is not configured")
-    url = f"{INDEX_BASE_URL}/records-{shard(key):03d}.json"
-    headers = {"Authorization": f"Bearer {INDEX_TOKEN}"} if INDEX_TOKEN else {}
-    response = client.get(url, headers=headers)
-    if response.status_code == 404:
-        return []
-    response.raise_for_status()
-    payload = response.json()
-    return payload.get(key, []) if isinstance(payload, dict) else []
+PHONE_FILES = sorted(fs.glob(f"{BUCKET}/idx_phone.*.parquet"))
+AADHAAR_FILES = sorted(fs.glob(f"{BUCKET}/idx_aadhaar.*.parquet"))
 
-def do_lookup(key: str):
-    started = time.perf_counter()
+if not AADHAAR_FILES:
+    AADHAAR_FILES = sorted(fs.glob(f"{BUCKET}/idx_aadhar.*.parquet"))
+
+if not PHONE_FILES:
+    raise RuntimeError("No idx_phone.*.parquet files were found in the Hugging Face bucket.")
+
+if not AADHAAR_FILES:
+    raise RuntimeError("No idx_aadhaar.*.parquet or idx_aadhar.*.parquet files were found.")
+
+phone_dataset = ds.dataset(PHONE_FILES, filesystem=fs, format="parquet")
+aadhaar_dataset = ds.dataset(AADHAAR_FILES, filesystem=fs, format="parquet")
+
+
+def _column_type(dataset: ds.Dataset, column: str) -> pa.DataType:
     try:
-        rows = lookup(key)[:MAX_RESULTS]
-    except RuntimeError as exc:
-        raise HTTPException(503, str(exc))
-    except httpx.HTTPError as exc:
-        raise HTTPException(502, "Index request failed") from exc
+        return dataset.schema.field(column).type
+    except KeyError as exc:
+        raise RuntimeError(
+            f"Required index column '{column}' was not found. Available columns: {dataset.schema.names}"
+        ) from exc
+
+
+def _typed_value(dataset: ds.Dataset, column: str, value: str) -> Any:
+    dtype = _column_type(dataset, column)
+    if pa.types.is_integer(dtype):
+        try:
+            return int(value)
+        except ValueError as exc:
+            raise HTTPException(400, f"{column} is numeric but the supplied value is invalid.") from exc
+    if pa.types.is_floating(dtype):
+        try:
+            return float(value)
+        except ValueError as exc:
+            raise HTTPException(400, f"{column} is numeric but the supplied value is invalid.") from exc
+    return value
+
+
+def _lookup(dataset: ds.Dataset, column: str, value: str) -> dict[str, Any]:
+    started = time.perf_counter()
+    typed = _typed_value(dataset, column, value)
+    filter_expr = ds.field(column) == typed
+    rows: list[dict[str, Any]] = []
+
+    scanner = dataset.scanner(
+        filter=filter_expr,
+        batch_size=BATCH_SIZE,
+        use_threads=True,
+    )
+
+    for batch in scanner.to_batches():
+        remaining = MAX_RESULTS - len(rows)
+        if remaining <= 0:
+            break
+        rows.extend(batch.to_pylist()[:remaining])
+        if len(rows) >= MAX_RESULTS:
+            break
+
     return {
-        "status": "success",
-        "type": "record",
-        "query": key,
         "results": rows,
         "count": len(rows),
-        "lookup_ms": round((time.perf_counter() - started) * 1000, 3),
+        "lookup_ms": round((time.perf_counter() - started) * 1000, 2),
     }
+
 
 @app.get("/")
 def root():
     return {
-        "name": "Hi-db Fast Lookup API",
         "status": "online",
-        "endpoints": ["/health", "/record={record_id}", "/record/{record_id}", "/search?q=VALUE"],
+        "developer": DEVELOPER,
+        "backend": "PyArrow + HuggingFace HfFileSystem",
+        "database": BUCKET,
+        "endpoints": {
+            "number": "/number=<10-15 digit number>",
+            "aadhar": "/aadhar=<12 digit Aadhaar>",
+        },
+        "phone_index_parts": len(PHONE_FILES),
+        "aadhar_index_parts": len(AADHAAR_FILES),
     }
+
 
 @app.get("/health")
 def health():
     return {
         "status": "ok",
-        "index_configured": bool(INDEX_BASE_URL),\n        "database_url": DATABASE_URL,
-        "shards": SHARD_COUNT,
-        "cache": lookup.cache_info()._asdict(),
+        "developer": DEVELOPER,
+        "backend": "PyArrow + HuggingFace HfFileSystem",
+        "database": BUCKET,
+        "phone_index_parts": len(PHONE_FILES),
+        "aadhar_index_parts": len(AADHAAR_FILES),
     }
 
-@app.get("/record={record_id}")
-def record_lookup(record_id: str):
-    if not record_id or len(record_id) > 128:
-        raise HTTPException(400, "Invalid record id")
-    return do_lookup(record_id)
 
-@app.get("/record/{record_id}")
-def record_lookup_path(record_id: str):
-    if not record_id or len(record_id) > 128:
-        raise HTTPException(400, "Invalid record id")
-    return do_lookup(record_id)
+@app.get("/number={number}")
+def number_lookup(number: str):
+    number = number.strip()
+    if not PHONE_RE.fullmatch(number):
+        raise HTTPException(400, "Number must contain 10 to 15 digits.")
+    data = _lookup(phone_dataset, "phoneNumber", number)
+    return {
+        "status": "success" if data["count"] else "not_found",
+        "developer": DEVELOPER,
+        "type": "number",
+        "number": number,
+        **data,
+    }
 
-@app.get("/search")
-def search(q: str = Query(..., min_length=1, max_length=128)):
-    return do_lookup(q.strip())
+
+@app.get("/aadhar={aadhar}")
+def aadhar_lookup(aadhar: str):
+    aadhar = aadhar.strip()
+    if not AADHAAR_RE.fullmatch(aadhar):
+        raise HTTPException(400, "Aadhaar value must contain exactly 12 digits.")
+    data = _lookup(aadhaar_dataset, "aadharNumber", aadhar)
+    return {
+        "status": "success" if data["count"] else "not_found",
+        "developer": DEVELOPER,
+        "type": "aadhar",
+        "aadhar": aadhar,
+        **data,
+    }
