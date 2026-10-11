@@ -79,7 +79,7 @@ def main() -> None:
             ORDER BY shard, CAST(account_id AS VARCHAR)
         )
         TO '{output_path}'
-        (FORMAT PARQUET, PARTITION_BY (shard), COMPRESSION ZSTD, ROW_GROUP_SIZE 50000)
+        (FORMAT PARQUET, PARTITION_BY (shard), COMPRESSION ZSTD, ROW_GROUP_SIZE 49152)
     """
     print(f"Found {len(source_paths)} source Parquet files.")
     print("Building sorted, 256-way account_id index; this is a one-time full-data scan...")
