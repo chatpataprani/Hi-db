@@ -1,34 +1,63 @@
-# Hi-db — Fast SQLite Lookup API
+# Hi-db — 438 GB SQLite Search API
 
-Goal: build a Vercel API for the synthetic database stored in the Hugging Face bucket
-`Chatpataprani/Ind438GB-bucket`, with the SQLite file `User_data.db`.
+The source database is stored in the Hugging Face bucket
+`Chatpataprani/Ind438GB-bucket/users_data.db` (438,408,007,680 bytes).
 
-**Latency target:** under 100 ms for warm indexed lookups. This is a benchmark target, not a guarantee; network time, cold starts, and the eventual storage/index design affect actual response time.
+## Findings so far
 
-## Important architecture note
+- SQLite table: `users`
+- Columns: `mobile`, `name`, `fname`, `address`, `alt`, `circle`, `id`, `email`
+- Existing indexes: `idx_mobile`, `idx_id`, `idx_email`, `idx_alt`
+- Hugging Face remote random reads worked, but a remote SQLite experiment took 1,312 ms for one indexed lookup and then raised an I/O error. Do not use that experimental adapter in production.
+- The database must not be downloaded to the user's phone or bundled into Vercel.
 
-Do not download or scan a 438 GB database on every Vercel request, and do not bundle it into the Vercel deployment. Vercel functions have limited deployment/runtime storage. We first need the database schema and the exact search key(s), then we can choose the smallest viable indexed/sharded design and benchmark it.
+## Recommended architecture
 
-## Step 1 — inspect the SQLite schema
+1. Keep the original database in Hugging Face as the source copy.
+2. Copy it once to a persistent server disk with at least 500 GB available (600 GB is safer for operational headroom). Run SQLite locally against the existing indexes.
+3. Run `service/app.py` on that server. It opens the database read-only and only supports exact-match searches on the four existing indexed fields.
+4. Run `api/index.py` on Vercel as a lightweight authenticated gateway to the search service.
+5. Benchmark cold and warm requests, plus p50/p95 under concurrency, before promising any latency target.
 
-The repo includes `inspect_sqlite.py`. Run it on a machine where `User_data.db` is available:
+The current service intentionally does not support name/address substring searches because those fields are not indexed. Adding those searches requires a separate indexing design.
 
-```bash
-python inspect_sqlite.py /path/to/User_data.db > schema-report.json
-```
+## Environment variables
 
-The report contains table/column names, existing index definitions, SQLite page statistics, and file size. It does **not** print record contents or run full-table row counts.
+### Persistent search service
 
-Share the contents of `schema-report.json` here. It should contain schema metadata only; do not upload the database or any real records to GitHub.
+- `DB_PATH`: path to the locally stored database; default `/data/users_data.db`
+- `API_TOKEN`: long random secret shared only with the Vercel gateway
+- `MAX_RESULTS`: result cap from 1 to 25; default 10
 
-## Step 2 — index and benchmark
+### Vercel gateway
 
-Once we know the schema and which field(s) need lookup, we can build the correct index builder and API endpoints. The index should be created once and stored separately from the raw database; each request must query only the relevant shard/index, never scan the full source.
+- `SEARCH_SERVICE_URL`: base URL of the persistent search service
+- `SEARCH_API_TOKEN`: same value as the search service's `API_TOKEN`
+- `CLIENT_API_KEY`: client-facing bearer key; lookups fail closed if this is not configured
+- `MAX_RESULTS`: result cap from 1 to 25; default 10
 
-After deployment, benchmark warm and cold requests separately. We should report measured p50/p95 latency rather than claim <100 ms before testing.
+Never commit tokens to GitHub. Use the hosting providers' secret/environment-variable settings.
 
-## Hugging Face bucket
+## API endpoints
 
-`https://huggingface.co/buckets/Chatpataprani/Ind438GB-bucket`
+All lookup endpoints require `Authorization: Bearer <CLIENT_API_KEY>`.
 
-If the bucket is private, the indexing job will need a Hugging Face read token stored as a secret/environment variable, not committed to this repository.
+- `GET /lookup?field=mobile&value=...&limit=10`
+- `GET /lookup?field=id&value=...&limit=10`
+- `GET /lookup?field=email&value=...&limit=10`
+- `GET /lookup?field=alt&value=...&limit=10`
+- Compatibility routes: `/number=<value>`, `/id=<value>`, `/email=<value>`, `/alt=<value>`
+- `GET /health`
+
+The service is read-only and uses parameterized values. The set of SQL column names is an explicit allowlist.
+
+## Time estimates (planning estimates, not measured guarantees)
+
+- One-time transfer of 438 GB: roughly 2–10+ hours depending on sustained throughput, Hugging Face delivery, and the server's disk. At 20 MB/s, the transfer alone is about 6.1 hours; at 100 MB/s, about 1.2 hours before overhead.
+- Service setup and validation after the disk is ready: about 1–3 hours.
+- First usable deployment: plan for half a day to a full day once a suitable server and credentials are available; slow transfer or provider setup can extend this to 1–2 days.
+- Search latency after the database is local: a reasonable initial expectation is single-digit to tens of milliseconds for a warm indexed SQLite query, plus network/API overhead. End-to-end results may be around 30–150 ms depending on region, payload size, and load. This is an estimate, not a benchmark; the under-100 ms target must be verified.
+
+## Status
+
+The service and gateway code are scaffolds committed to the repository, but the 438 GB database has not been copied to a persistent server and no live search deployment has been verified yet. A cloud account with suitable persistent storage is still needed.
