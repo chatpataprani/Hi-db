@@ -27,31 +27,27 @@ OUTPUT_COLUMNS = [
 ]
 
 app = FastAPI(title="Hi-db Account Lookup API", version="8.0.0")
-_db_lock = threading.RLock()
-_connection: duckdb.DuckDBPyConnection | None = None
-_fs: HfFileSystem | None = None
+_connection_lock = threading.Lock()
+_thread_local = threading.local()
 
 
 def _get_connection() -> duckdb.DuckDBPyConnection:
-    global _connection, _fs
-    if _connection is not None:
-        return _connection
+    # FastAPI runs synchronous endpoints in worker threads. Keep one DuckDB
+    # connection per worker so separate lookups do not serialize on one handle.
+    con = getattr(_thread_local, "connection", None)
+    if con is not None:
+        return con
 
-    with _db_lock:
-        if _connection is not None:
-            return _connection
-
+    with _connection_lock:
         # Vercel functions have writable temporary storage only.
         os.makedirs("/tmp/duckdb_extensions", exist_ok=True)
         con = duckdb.connect()
         con.execute("SET home_directory='/tmp'")
         con.execute("SET extension_directory='/tmp/duckdb_extensions'")
         con.execute("SET threads=2")
-
         fs = HfFileSystem(token=HF_TOKEN if HF_TOKEN else False)
         con.register_filesystem(fs)
-        _connection = con
-        _fs = fs
+        _thread_local.connection = con
         return con
 
 
@@ -121,20 +117,19 @@ def lookup(
     started = time.perf_counter()
 
     try:
-        with _db_lock:
-            con = _get_connection()
-            # The shard path is assembled only from configured bucket/prefix and
-            # a two-character hexadecimal shard; values remain SQL parameters.
-            escaped_path = remote_path.replace("'", "''")
-            sql = f"""
-                SELECT {", ".join(OUTPUT_COLUMNS)}
-                FROM read_parquet('{escaped_path}')
-                WHERE CAST(account_id AS VARCHAR) = ?
-                LIMIT ?
-            """
-            cursor = con.execute(sql, [key, min(limit, MAX_RESULTS)])
-            columns = [item[0] for item in cursor.description]
-            rows = [dict(zip(columns, row)) for row in cursor.fetchall()]
+        con = _get_connection()
+        # The shard path is assembled only from configured bucket/prefix and
+        # a two-character hexadecimal shard; values remain SQL parameters.
+        escaped_path = remote_path.replace("'", "''")
+        sql = f"""
+            SELECT {", ".join(OUTPUT_COLUMNS)}
+            FROM read_parquet('{escaped_path}')
+            WHERE CAST(account_id AS VARCHAR) = ?
+            LIMIT ?
+        """
+        cursor = con.execute(sql, [key, min(limit, MAX_RESULTS)])
+        columns = [item[0] for item in cursor.description]
+        rows = [dict(zip(columns, row)) for row in cursor.fetchall()]
     except Exception as exc:
         # Do not expose tokens, remote URLs, or raw connector errors to clients.
         message = str(exc).lower()
