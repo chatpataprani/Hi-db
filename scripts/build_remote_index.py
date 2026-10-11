@@ -66,7 +66,8 @@ def main() -> None:
         )
 
     source_list = "[" + ", ".join(sql_string("hf://" + p.lstrip("/")) for p in source_paths) + "]"
-    # With PARTITION_BY, DuckDB writes a directory containing shard=xx/data_0.parquet.\n    output_path = str(OUTPUT_DIR).replace("'", "''")
+    # With PARTITION_BY, DuckDB writes a directory containing shard=xx/data_0.parquet.
+    output_path = str(OUTPUT_DIR).replace("'", "''")
     selected = ", ".join(
         f"CAST({column} AS VARCHAR) AS {column}" for column in COLUMNS
     )
