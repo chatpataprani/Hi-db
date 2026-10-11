@@ -1,4 +1,3 @@
-import hmac
 import os
 import sqlite3
 import time
@@ -7,26 +6,14 @@ from typing import Iterator
 from contextlib import contextmanager
 from queue import Queue, Empty
 
-from fastapi import Depends, FastAPI, HTTPException, Query
-from fastapi.security import HTTPAuthorizationCredentials, HTTPBearer
+from fastapi import FastAPI, HTTPException, Query
 
 DB_PATH = Path(os.getenv("DB_PATH", "/data/telegram_lookup.db")).resolve()
-API_TOKEN = os.getenv("API_TOKEN", "")
 POOL_SIZE = max(2, min(int(os.getenv("DB_POOL_SIZE", "8")), 32))
 MAX_RESULTS = max(1, min(int(os.getenv("MAX_RESULTS", "10")), 25))
 pool: Queue = Queue(maxsize=POOL_SIZE)
-bearer = HTTPBearer(auto_error=False)
 
 app = FastAPI(title="Chatpataprani Telegram Account Lookup", version="1.0.0")
-
-
-def require_token(credentials: HTTPAuthorizationCredentials | None = Depends(bearer)):
-    if not API_TOKEN:
-        raise HTTPException(status_code=503, detail="API authentication is not configured.")
-    if credentials is None or credentials.scheme.lower() != "bearer":
-        raise HTTPException(status_code=401, detail="Bearer token required.")
-    if not hmac.compare_digest(credentials.credentials, API_TOKEN):
-        raise HTTPException(status_code=401, detail="Invalid API token.")
 
 
 def connect():
@@ -71,13 +58,12 @@ def health():
     return {
         "status": "ok" if DB_PATH.is_file() else "waiting_for_index",
         "index_ready": DB_PATH.is_file(),
-        "authentication_configured": bool(API_TOKEN),
         "search_field": "account_id",
         "return_fields": ["phone", "email", "linked_id", "linked_name", "linked_handle"],
     }
 
 
-@app.get("/lookup", dependencies=[Depends(require_token)])
+@app.get("/lookup")
 def lookup(account_id: str = Query(..., min_length=1, max_length=128),
            limit: int = Query(10, ge=1, le=25)):
     account_id = account_id.strip()
