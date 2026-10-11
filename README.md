@@ -1,74 +1,34 @@
-# Hi-db Fast Lookup API
+# Hi-db — Fast SQLite Lookup API
 
-FastAPI service for a synthetic learning database.
+Goal: build a Vercel API for the synthetic database stored in the Hugging Face bucket
+`Chatpataprani/Ind438GB-bucket`, with the SQLite file `User_data.db`.
 
-## Architecture
+**Latency target:** under 100 ms for warm indexed lookups. This is a benchmark target, not a guarantee; network time, cold starts, and the eventual storage/index design affect actual response time.
 
-Do **not** scan the 74 GB raw archive on every Vercel request. Build compact lookup shards once, host those shards, and let Vercel perform one small shard request per lookup.
+## Important architecture note
 
-The API supports:
+Do not download or scan a 438 GB database on every Vercel request, and do not bundle it into the Vercel deployment. Vercel functions have limited deployment/runtime storage. We first need the database schema and the exact search key(s), then we can choose the smallest viable indexed/sharded design and benchmark it.
 
-- `/health`
-- `/record=VALUE`
-- `/record/VALUE`
-- `/search?q=VALUE`
+## Step 1 — inspect the SQLite schema
 
-Responses include `lookup_ms`.
-
-## Build the index
-
-Run the one-time `hf_indexer.py` job on a machine/Hugging Face Job with enough temporary disk for the extracted dataset.
-
-If the bucket contains split ZIP parts such as `Hi-Tek-DB.zip.001`, `.002`, etc.:
+The repo includes `inspect_sqlite.py`. Run it on a machine where `User_data.db` is available:
 
 ```bash
-hf buckets sync hf://buckets/Chatpataprani/HITECH_DATABASE-bucket /data/source
-cat /data/source/Hi-Tek-DB.zip.* > /data/Hi-Tek-DB.zip
-mkdir -p /data/extracted
-unzip -q /data/Hi-Tek-DB.zip -d /data/extracted
+python inspect_sqlite.py /path/to/User_data.db > schema-report.json
 ```
 
-Then:
+The report contains table/column names, existing index definitions, SQLite page statistics, and file size. It does **not** print record contents or run full-table row counts.
 
-```export SOURCE_DIR=/data/extracted
-export OUT_DIR=/data/indexes
-python hf_indexer.py
-```
+Share the contents of `schema-report.json` here. It should contain schema metadata only; do not upload the database or any real records to GitHub.
 
-If the searchable field is not `record_id`, `id`, `uuid`, or `key`, set it explicitly:
+## Step 2 — index and benchmark
 
-```export KEY_FIELD=your_field_name
-python hf_indexer.py
-```
+Once we know the schema and which field(s) need lookup, we can build the correct index builder and API endpoints. The index should be created once and stored separately from the raw database; each request must query only the relevant shard/index, never scan the full source.
 
-The result is:
+After deployment, benchmark warm and cold requests separately. We should report measured p50/p95 latency rather than claim <100 ms before testing.
 
-```
-indexes/
-  records-000.json
-  ...
-  records-255.json
-```
+## Hugging Face bucket
 
-Host those files somewhere reachable over HTTPS, then set this Vercel environment variable:
+`https://huggingface.co/buckets/Chatpataprani/Ind438GB-bucket`
 
-```
-INDEX_BASE_URL=https://your-index-host
-```
-
-Optional:
-
-```
-INDEX_TOKEN=...
-SHARD_COUNT=256
-MAX_RESULTS=25
-```
-
-## Test
-
-```
-https://YOUR-VERCEL-DOMAIN/health
-https://YOUR-VERCEL-DOMAIN/search?q=VALUE
-```
-
-The raw database stays outside GitHub and Vercel.
+If the bucket is private, the indexing job will need a Hugging Face read token stored as a secret/environment variable, not committed to this repository.
