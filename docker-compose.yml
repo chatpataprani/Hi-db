@@ -1,0 +1,19 @@
+services:
+  telegram-lookup:
+    build:
+      context: ./telegram_service
+    ports:
+      - "${PORT:-8000}:8000"
+    environment:
+      DB_PATH: /data/telegram_lookup.db
+      PARQUET_DIR: /data/telegram_parquet
+      HF_BUCKET_ID: ${HF_BUCKET_ID:-Chatpataprani/Telegram-DB-bucket}
+      HF_TOKEN: ${HF_TOKEN:-}
+      DB_POOL_SIZE: ${DB_POOL_SIZE:-8}
+      MAX_RESULTS: ${MAX_RESULTS:-10}
+    volumes:
+      - telegram_data:/data
+    restart: unless-stopped
+
+volumes:
+  telegram_data:
