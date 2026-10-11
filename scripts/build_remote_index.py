@@ -66,7 +66,7 @@ def main() -> None:
         )
 
     source_list = "[" + ", ".join(sql_string("hf://" + p.lstrip("/")) for p in source_paths) + "]"
-    output_path = str(OUTPUT_DIR / "shard.parquet").replace("'", "''")
+    # With PARTITION_BY, DuckDB writes a directory containing shard=xx/data_0.parquet.\n    output_path = str(OUTPUT_DIR).replace("'", "''")
     selected = ", ".join(
         f"CAST({column} AS VARCHAR) AS {column}" for column in COLUMNS
     )
@@ -89,7 +89,7 @@ def main() -> None:
     # same bucket; the API reads only the shard matching the query's MD5 prefix.
     local_files = sorted(OUTPUT_DIR.glob("shard=*/data_0.parquet"))
     if not local_files:
-        raise SystemExit("Index build produced no shard files.")
+        raise SystemExit("Index build produced no shard files. Check DuckDB output path and source schema.")
 
     remote_root = f"buckets/{BUCKET_ID}/{INDEX_PREFIX.strip('/')}"
     uploaded = 0
@@ -103,7 +103,7 @@ def main() -> None:
 
     print(f"Done. Uploaded {uploaded} shards to hf://{remote_root}/.")
     print("Set HI_DB_BUCKET and HI_DB_INDEX_PREFIX consistently in Vercel.")
-    print("Set HI_DB_API_KEY in Vercel before enabling lookups.")
+    print("The lookup endpoint does not require an API key.")
 
 
 if __name__ == "__main__":
