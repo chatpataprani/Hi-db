@@ -27,7 +27,7 @@ OUTPUT_COLUMNS = [
 ]
 
 app = FastAPI(title="Hi-db Account Lookup API", version="8.0.0")
-_db_lock = threading.Lock()
+_db_lock = threading.RLock()
 _connection: duckdb.DuckDBPyConnection | None = None
 _fs: HfFileSystem | None = None
 
